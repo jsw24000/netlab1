@@ -141,6 +141,43 @@ bool perform_list_request(int socket_fd) {
     return true;
 }
 
+bool perform_change_dir_request(int socket_fd, const std::string& directory) {
+    // CHANGE_DIR_REQUEST carries one null-terminated directory name as payload.
+    const std::uint32_t payload_length =
+        static_cast<std::uint32_t>(directory.size() + 1);
+    const myftp::Header request = myftp::make_header(
+        myftp::MessageType::CHANGE_DIR_REQUEST,
+        0,
+        myftp::kHeaderLength + payload_length);
+
+    if (!myftp::send_all(socket_fd, &request, sizeof(request)) ||
+        !myftp::send_all(socket_fd, directory.c_str(), payload_length)) {
+        std::cerr << "failed to send CHANGE_DIR_REQUEST" << std::endl;
+        return false;
+    }
+
+    myftp::Header reply{};
+    if (!myftp::recv_all(socket_fd, &reply, sizeof(reply))) {
+        std::cerr << "failed to receive CHANGE_DIR_REPLY" << std::endl;
+        return false;
+    }
+
+    if (!myftp::has_valid_magic(reply) ||
+        reply.m_type != static_cast<std::uint8_t>(
+                            myftp::MessageType::CHANGE_DIR_REPLY) ||
+        (reply.m_status != 0 && reply.m_status != 1) ||
+        myftp::total_length(reply) != myftp::kHeaderLength) {
+        std::cerr << "invalid CHANGE_DIR_REPLY" << std::endl;
+        return false;
+    }
+
+    if (reply.m_status == 0) {
+        std::cerr << "server directory does not exist" << std::endl;
+    }
+
+    return true;
+}
+
 bool perform_quit_handshake(int socket_fd) {
     const myftp::Header request = myftp::make_header(
         myftp::MessageType::QUIT_REQUEST,
@@ -236,6 +273,23 @@ int main() {
             }
 
             perform_list_request(socket_fd);
+            continue;
+        }
+
+        if (command == "cd") {
+            if (socket_fd < 0) {
+                std::cerr << "no myFTP connection is open" << std::endl;
+                continue;
+            }
+
+            std::string directory;
+            std::string extra;
+            if (!(input >> directory) || (input >> extra)) {
+                std::cerr << "usage: cd <directory>" << std::endl;
+                continue;
+            }
+
+            perform_change_dir_request(socket_fd, directory);
             continue;
         }
 

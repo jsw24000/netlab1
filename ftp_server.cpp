@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <netinet/in.h>
 #include <string>
@@ -52,8 +53,27 @@ bool send_open_reply(int client_fd) {
     // 调用 send_all 函数将 OPEN_CONN_REPLY 消息发送给客户端，表示 myFTP 连接已建立
 }
 
-bool get_file_list(std::string& file_list) {
-    FILE* pipe = popen("ls", "r");
+std::string shell_quote(const std::string& value) {
+    std::string quoted = "'";
+    for (const char ch : value) {
+        if (ch == '\'') {
+            quoted += "'\\''";
+        } else {
+            quoted += ch;
+        }
+    }
+    quoted += "'";
+    return quoted;
+}
+
+bool get_file_list(const std::filesystem::path& current_directory,
+                   std::string& file_list) {
+    // Run `ls` in a child shell so each client's logical working directory is
+    // independent; do not call process-wide chdir() in the server.
+    const std::string command =
+        "cd " + shell_quote(current_directory.string()) + " && ls";
+
+    FILE* pipe = popen(command.c_str(), "r");
     if (pipe == nullptr) {
         return false;
     }
@@ -98,6 +118,14 @@ bool send_list_reply(int client_fd, const std::string& file_list) {
                            payload_length);
 }
 
+bool send_change_dir_reply(int client_fd, bool success) {
+    const myftp::Header reply = myftp::make_header(
+        myftp::MessageType::CHANGE_DIR_REPLY,
+        success ? 1 : 0,
+        myftp::kHeaderLength);
+    return myftp::send_all(client_fd, &reply, sizeof(reply));
+}
+
 bool send_quit_reply(int client_fd) {
     const myftp::Header reply = myftp::make_header(
         myftp::MessageType::QUIT_REPLY,
@@ -108,6 +136,10 @@ bool send_quit_reply(int client_fd) {
 
 void handle_client(int client_fd) {
     bool myftp_open = false;
+
+    // Each client maintains its own logical current directory. This starts at
+    // the directory from which ftp_server itself was launched.
+    std::filesystem::path current_directory = std::filesystem::current_path();
 
     while (true) {
         myftp::Header header{};
@@ -172,13 +204,47 @@ void handle_client(int client_fd) {
             }
 
             std::string file_list;
-            if (!get_file_list(file_list)) {
+            if (!get_file_list(current_directory, file_list)) {
                 std::cerr << "failed to get file list" << std::endl;
                 return;
             }
 
             if (!send_list_reply(client_fd, file_list)) {
                 std::cerr << "failed to send LIST_REPLY" << std::endl;
+                return;
+            }
+
+            continue;
+        }
+
+        if (type == myftp::MessageType::CHANGE_DIR_REQUEST) {
+            if (payload.empty() || payload.back() != '\0') {
+                std::cerr << "invalid CHANGE_DIR_REQUEST payload" << std::endl;
+                return;
+            }
+
+            const std::string directory(
+                reinterpret_cast<const char*>(payload.data()));
+
+            // The payload must contain exactly one null-terminated string.
+            if (directory.size() + 1 != payload.size()) {
+                std::cerr << "invalid CHANGE_DIR_REQUEST payload" << std::endl;
+                return;
+            }
+
+            const std::filesystem::path next_directory =
+                current_directory / directory;
+
+            std::error_code ec;
+            const bool exists =
+                std::filesystem::is_directory(next_directory, ec) && !ec;
+
+            if (exists) {
+                current_directory = next_directory.lexically_normal();
+            }
+
+            if (!send_change_dir_reply(client_fd, exists)) {
+                std::cerr << "failed to send CHANGE_DIR_REPLY" << std::endl;
                 return;
             }
 
@@ -201,7 +267,7 @@ void handle_client(int client_fd) {
             return;
         }
 
-        // CD/GET/PUT/SHA will be implemented in later stages.
+        // GET/PUT/SHA will be implemented in later stages.
         std::cerr << "myFTP message type 0x" << std::hex
                   << static_cast<int>(header.m_type) << std::dec
                   << " is not implemented yet" << std::endl;
