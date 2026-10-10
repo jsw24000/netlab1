@@ -3,8 +3,10 @@
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <netinet/in.h>
 #include <sstream>
 #include <string>
@@ -271,6 +273,96 @@ bool perform_get_request(int socket_fd, const std::string& filename) {
     return true;
 }
 
+bool perform_put_request(int socket_fd, const std::string& filename) {
+    // The Client must check that the local file exists before sending
+    // PUT_REQUEST.
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(filename, ec) || ec) {
+        std::cerr << "local file does not exist: " << filename << std::endl;
+        return true;
+    }
+
+    const std::uintmax_t file_size = std::filesystem::file_size(filename, ec);
+    if (ec ||
+        file_size >
+            static_cast<std::uintmax_t>(
+                std::numeric_limits<std::uint32_t>::max() -
+                myftp::kHeaderLength)) {
+        std::cerr << "failed to determine local file size: "
+                  << filename << std::endl;
+        return false;
+    }
+
+    std::ifstream input_file(filename, std::ios::binary);
+    if (!input_file) {
+        std::cerr << "failed to open local file for reading: "
+                  << filename << std::endl;
+        return true;
+    }
+
+    // PUT_REQUEST carries one null-terminated file name as payload.
+    const std::uint32_t payload_length =
+        static_cast<std::uint32_t>(filename.size() + 1);
+    const myftp::Header request = myftp::make_header(
+        myftp::MessageType::PUT_REQUEST,
+        0,
+        myftp::kHeaderLength + payload_length);
+
+    if (!myftp::send_all(socket_fd, &request, sizeof(request)) ||
+        !myftp::send_all(socket_fd, filename.c_str(), payload_length)) {
+        std::cerr << "failed to send PUT_REQUEST" << std::endl;
+        return false;
+    }
+
+    // The Server acknowledges PUT_REQUEST before the Client sends FILE_DATA.
+    myftp::Header reply{};
+    if (!myftp::recv_all(socket_fd, &reply, sizeof(reply))) {
+        std::cerr << "failed to receive PUT_REPLY" << std::endl;
+        return false;
+    }
+
+    if (!myftp::has_valid_magic(reply) ||
+        reply.m_type != static_cast<std::uint8_t>(
+                            myftp::MessageType::PUT_REPLY) ||
+        myftp::total_length(reply) != myftp::kHeaderLength) {
+        std::cerr << "invalid PUT_REPLY" << std::endl;
+        return false;
+    }
+
+    // 如果 PUT_REPLY 消息头有效，则发送 FILE_DATA 消息头，告诉服务器接下来要发送的文件数据的总长度（包括协议头和有效负载）。然后将文件数据分块发送给服务器，直到文件数据发送完毕。如果发送失败，则返回 false。最后返回 true，表示文件上传成功。
+    const myftp::Header data_header = myftp::make_header(
+        myftp::MessageType::FILE_DATA,
+        0,
+        myftp::kHeaderLength + static_cast<std::uint32_t>(file_size));
+
+    if (!myftp::send_all(socket_fd, &data_header, sizeof(data_header))) {
+        std::cerr << "failed to send FILE_DATA header" << std::endl;
+        return false;
+    }
+
+    // Send the file payload in chunks. The file is opened in binary mode, so
+    // arbitrary byte values (including '\0') are transferred unchanged.
+    char buffer[8192];
+    while (input_file) {
+        input_file.read(buffer, sizeof(buffer));
+        const std::streamsize count = input_file.gcount();
+        if (count > 0 &&
+            !myftp::send_all(socket_fd,
+                             buffer,
+                             static_cast<std::size_t>(count))) {
+            std::cerr << "failed to send file data" << std::endl;
+            return false;
+        }
+    }
+
+    if (!input_file.eof()) {
+        std::cerr << "failed to read local file: " << filename << std::endl;
+        return false;
+    }
+
+    return true;
+}
+
 bool perform_quit_handshake(int socket_fd) {
     const myftp::Header request = myftp::make_header(
         myftp::MessageType::QUIT_REQUEST,
@@ -400,6 +492,23 @@ int main() {
             }
 
             perform_get_request(socket_fd, filename);
+            continue;
+        }
+
+        if (command == "put") {
+            if (socket_fd < 0) {
+                std::cerr << "no myFTP connection is open" << std::endl;
+                continue;
+            }
+
+            std::string filename;
+            std::string extra;
+            if (!(input >> filename) || (input >> extra)) {
+                std::cerr << "usage: put <filename>" << std::endl;
+                continue;
+            }
+
+            perform_put_request(socket_fd, filename);
             continue;
         }
 

@@ -181,6 +181,69 @@ bool send_file_data(int client_fd, const std::filesystem::path& file_path) {
     return input.eof();
 }
 
+bool send_put_reply(int client_fd) {
+    const myftp::Header reply = myftp::make_header(
+        myftp::MessageType::PUT_REPLY,
+        0,
+        myftp::kHeaderLength);
+    return myftp::send_all(client_fd, &reply, sizeof(reply));
+}
+
+bool receive_file_data(int client_fd,
+                       const std::filesystem::path& file_path) {
+    // After PUT_REPLY, the next myFTP message must be FILE_DATA.
+    myftp::Header data_header{};
+
+    // 先接收 FILE_DATA 消息头，获取文件数据的总长度（包括协议头和有效负载）。然后根据总长度计算有效负载长度，并创建一个输出文件流，将接收到的文件数据写入指定的文件路径。使用一个缓冲区分块接收文件数据，直到接收完毕。
+    if (!myftp::recv_all(client_fd, &data_header, sizeof(data_header))) {
+        return false;
+    }
+
+    if (!myftp::has_valid_magic(data_header) ||
+        data_header.m_type != static_cast<std::uint8_t>(
+                                  myftp::MessageType::FILE_DATA)) {
+        return false;
+    }
+
+    const std::uint32_t data_message_length =
+        myftp::total_length(data_header);
+    if (data_message_length < myftp::kHeaderLength) {
+        return false;
+    }
+
+    std::uint32_t remaining =
+        data_message_length - myftp::kHeaderLength;
+
+    // An existing file on the Server is overwritten, and binary mode preserves
+    // the FILE_DATA payload byte-for-byte.
+    std::ofstream output(file_path,
+                         std::ios::binary | std::ios::trunc);
+    if (!output) {
+        return false;
+    }
+
+    char buffer[8192];
+    while (remaining > 0) {
+        const std::size_t chunk_size =
+            remaining < sizeof(buffer)
+                ? static_cast<std::size_t>(remaining)
+                : sizeof(buffer);
+
+        if (!myftp::recv_all(client_fd, buffer, chunk_size)) {
+            return false;
+        }
+
+        output.write(buffer, static_cast<std::streamsize>(chunk_size));
+        if (!output) {
+            return false;
+        }
+
+        remaining -= static_cast<std::uint32_t>(chunk_size);
+    }
+
+    return true;
+}
+
 bool send_quit_reply(int client_fd) {
     const myftp::Header reply = myftp::make_header(
         myftp::MessageType::QUIT_REPLY,
@@ -341,6 +404,38 @@ void handle_client(int client_fd) {
             continue;
         }
 
+        if (type == myftp::MessageType::PUT_REQUEST) {
+            if (payload.empty() || payload.back() != '\0') {
+                std::cerr << "invalid PUT_REQUEST payload" << std::endl;
+                return;
+            }
+
+            const std::string filename(
+                reinterpret_cast<const char*>(payload.data()));
+
+            // The payload must contain exactly one null-terminated file name.
+            if (filename.size() + 1 != payload.size()) {
+                std::cerr << "invalid PUT_REQUEST payload" << std::endl;
+                return;
+            }
+
+            const std::filesystem::path file_path =
+                current_directory / filename;
+
+            if (!send_put_reply(client_fd)) {
+                std::cerr << "failed to send PUT_REPLY" << std::endl;
+                return;
+            }
+
+            // The Client sends FILE_DATA immediately after receiving PUT_REPLY.
+            if (!receive_file_data(client_fd, file_path)) {
+                std::cerr << "failed to receive FILE_DATA" << std::endl;
+                return;
+            }
+
+            continue;
+        }
+
         if (type == myftp::MessageType::QUIT_REQUEST) {
             // QUIT_REQUEST 消息不应包含有效负载，因此总长度必须等于协议头长度（12 字节）。如果不满足此条件，则视为无效消息。
             if (message_length != myftp::kHeaderLength) {
@@ -357,7 +452,7 @@ void handle_client(int client_fd) {
             return;
         }
 
-        // PUT/SHA will be implemented in later stages.
+        // SHA will be implemented in a later stage.
         std::cerr << "myFTP message type 0x" << std::hex
                   << static_cast<int>(header.m_type) << std::dec
                   << " is not implemented yet" << std::endl;
