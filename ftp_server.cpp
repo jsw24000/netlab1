@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <netinet/in.h>
@@ -51,6 +52,54 @@ bool send_open_reply(int client_fd) {
     // 调用 send_all 函数将 OPEN_CONN_REPLY 消息发送给客户端，表示 myFTP 连接已建立
 }
 
+bool get_file_list(std::string& file_list) {
+    // 把 ls 命令的输出重定向到一个管道中，然后从管道中读取文件列表并存储在 file_list 字符串中
+    FILE* pipe = popen("ls", "r");
+    if (pipe == nullptr) {
+        return false;
+    }
+
+    char buffer[1024];
+    while (true) {
+        const std::size_t count = std::fread(buffer, 1, sizeof(buffer), pipe);
+        if (count > 0) {
+            file_list.append(buffer, count);
+        }
+
+        if (count < sizeof(buffer)) {
+            if (std::feof(pipe)) {
+                break;
+            }
+            if (std::ferror(pipe)) {
+                pclose(pipe);
+                return false;
+            }
+        }
+    }
+
+    return pclose(pipe) == 0;
+}
+
+bool send_list_reply(int client_fd, const std::string& file_list) {
+    // The LIST_REPLY payload is a null-terminated string, so the terminating
+    // '\0' is included in m_length and must also be sent on the TCP stream.
+    const std::uint32_t payload_length =
+        static_cast<std::uint32_t>(file_list.size() + 1);
+    
+    const myftp::Header reply = myftp::make_header( // 创建一个 LIST_REPLY 消息头，消息类型为 LIST_REPLY，状态码为 0，总长度为协议头长度加上有效负载长度（即文件列表字符串的长度加上一个空字符）
+        myftp::MessageType::LIST_REPLY,
+        0,
+        myftp::kHeaderLength + payload_length);
+
+    if (!myftp::send_all(client_fd, &reply, sizeof(reply))) {
+        return false;
+    }
+
+    return myftp::send_all(client_fd,
+                           file_list.c_str(),
+                           payload_length);
+}
+
 bool send_quit_reply(int client_fd) {
     const myftp::Header reply = myftp::make_header(
         myftp::MessageType::QUIT_REPLY,
@@ -74,7 +123,7 @@ void handle_client(int client_fd) {
             return;
         }
 
-        const std::uint32_t message_length = myftp::total_length(header);
+        const std::uint32_t message_length = myftp::total_length(header); // 读取消息头后，获取消息的总长度，包括协议头和有效负载。这个长度是从网络字节序转换为主机字节序后的值
         if (message_length < myftp::kHeaderLength) {
             std::cerr << "invalid myFTP message length" << std::endl;
             return;
@@ -84,9 +133,8 @@ void handle_client(int client_fd) {
             message_length - myftp::kHeaderLength;
         // 读取消息头后，计算消息的总长度和有效负载长度。消息总长度必须大于等于 myFTP 协议头的长度（12 字节），否则视为无效消息。有效负载长度为总长度减去协议头长度。
 
-        // At this stage OPEN and QUIT have no payload. Still consume any
-        // payload of an unsupported message so that the TCP byte stream stays
-        // aligned at the next header.
+        // Consume the payload before dispatching the message so that the TCP
+        // byte stream stays aligned at the next myFTP header.
         std::vector<std::uint8_t> payload(payload_length);
         if (payload_length > 0 &&
             !myftp::recv_all(client_fd, payload.data(), payload.size())) {
@@ -119,6 +167,26 @@ void handle_client(int client_fd) {
             return;
         }
 
+        if (type == myftp::MessageType::LIST_REQUEST) {
+            if (message_length != myftp::kHeaderLength) {
+                std::cerr << "invalid LIST_REQUEST length" << std::endl;
+                return;
+            }
+
+            std::string file_list;
+            if (!get_file_list(file_list)) {
+                std::cerr << "failed to get file list" << std::endl;
+                return;
+            }
+
+            if (!send_list_reply(client_fd, file_list)) {
+                std::cerr << "failed to send LIST_REPLY" << std::endl;
+                return;
+            }
+
+            continue;
+        }
+
         if (type == myftp::MessageType::QUIT_REQUEST) {
             // QUIT_REQUEST 消息不应包含有效负载，因此总长度必须等于协议头长度（12 字节）。如果不满足此条件，则视为无效消息。
             if (message_length != myftp::kHeaderLength) {
@@ -135,7 +203,7 @@ void handle_client(int client_fd) {
             return;
         }
 
-        // LIST/CD/GET/PUT/SHA will be implemented in later stages.
+        // CD/GET/PUT/SHA will be implemented in later stages.
         std::cerr << "myFTP message type 0x" << std::hex
                   << static_cast<int>(header.m_type) << std::dec
                   << " is not implemented yet" << std::endl;

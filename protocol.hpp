@@ -65,6 +65,7 @@ inline bool has_valid_magic(const Header& header) {
 
 inline std::uint32_t total_length(const Header& header) {
     return ntohl(header.m_length);
+    // 将 server 返回的 head 中的 m_length 字段从网络字节序转换为主机字节序，并返回转换后的值。这个函数用于获取 myFTP 消息的总长度，以便在接收消息时知道需要读取多少字节的数据。
 }
 
 // TCP is a byte stream: one send() is not guaranteed to be matched by one

@@ -9,6 +9,7 @@
 #include <string>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <vector>
 
 namespace {
 
@@ -85,6 +86,58 @@ bool perform_open_handshake(int socket_fd) {
         return false;
     }
 
+    return true;
+}
+
+bool perform_list_request(int socket_fd) {
+    const myftp::Header request = myftp::make_header(
+        myftp::MessageType::LIST_REQUEST,
+        0,
+        myftp::kHeaderLength);
+
+    if (!myftp::send_all(socket_fd, &request, sizeof(request))) {
+        std::cerr << "failed to send LIST_REQUEST" << std::endl;
+        return false;
+    }
+
+    myftp::Header reply{};
+    if (!myftp::recv_all(socket_fd, &reply, sizeof(reply))) {
+        std::cerr << "failed to receive LIST_REPLY" << std::endl;
+        return false;
+    }
+
+    if (!myftp::has_valid_magic(reply) ||
+        reply.m_type != static_cast<std::uint8_t>(
+                            myftp::MessageType::LIST_REPLY)) {
+        std::cerr << "invalid LIST_REPLY" << std::endl;
+        return false;
+    }
+
+    const std::uint32_t message_length = myftp::total_length(reply); // 可以直接作用于 reply.m_length 字段，获取 LIST_REPLY 消息的总长度，包括协议头和有效负载
+    if (message_length < myftp::kHeaderLength + 1) {
+        std::cerr << "invalid LIST_REPLY length" << std::endl;
+        return false;
+    }
+
+    const std::uint32_t payload_length =
+        message_length - myftp::kHeaderLength;
+    std::vector<std::uint8_t> payload(payload_length);
+
+    // 接收 LIST_REPLY 消息的有效负载部分，即文件列表字符串。有效负载长度为总长度减去协议头长度，必须大于等于 1 字节（至少包含一个空字符）。如果接收失败，则返回 false。
+    if (!myftp::recv_all(socket_fd, payload.data(), payload.size())) {
+        std::cerr << "failed to receive LIST_REPLY payload" << std::endl;
+        return false;
+    }
+
+    // LIST_REPLY payload is one null-terminated string.
+    if (payload.back() != '\0') {
+        std::cerr << "invalid LIST_REPLY payload" << std::endl;
+        return false;
+    }
+
+    std::cout.write(reinterpret_cast<const char*>(payload.data()),
+                    static_cast<std::streamsize>(payload.size() - 1));
+    std::cout.flush();
     return true;
 }
 
@@ -167,6 +220,22 @@ int main() {
             socket_fd = new_socket_fd;
             std::cout << "myFTP connection established to " << server_ip << ':'
                       << server_port << std::endl;
+            continue;
+        }
+
+        if (command == "ls") {
+            if (socket_fd < 0) {
+                std::cerr << "no myFTP connection is open" << std::endl;
+                continue;
+            }
+
+            std::string extra;
+            if (input >> extra) {
+                std::cerr << "usage: ls" << std::endl;
+                continue;
+            }
+
+            perform_list_request(socket_fd);
             continue;
         }
 
