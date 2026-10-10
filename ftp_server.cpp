@@ -12,6 +12,7 @@
 #include <netinet/in.h>
 #include <string>
 #include <sys/socket.h>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -625,8 +626,9 @@ int main(int argc, char* argv[]) {
     std::cout << "TCP server listening on " << listen_ip << ':' << listen_port
               << std::endl;
 
-    // Still single-client-at-a-time at this stage. Concurrency will be added
-    // after the core myFTP request/reply behavior is correct.
+    // Accept new TCP connections continuously. Each connected Client is
+    // handled by its own service thread, so one Client waiting on a request
+    // does not block other Clients from being accepted or served.
     while (true) {
         sockaddr_in client_addr{};
         socklen_t client_addr_len = sizeof(client_addr);
@@ -649,8 +651,15 @@ int main(int argc, char* argv[]) {
         }
 
         print_client_address(client_addr);
-        handle_client(client_fd);
-        close(client_fd);
+
+        // client_fd belongs to this worker after the thread starts. The worker
+        // keeps all per-Client protocol state (including current_directory)
+        // inside handle_client(), closes the connection when finished, and is
+        // detached because the Server does not need to wait for it here.
+        std::thread([client_fd]() {
+            handle_client(client_fd);
+            close(client_fd);
+        }).detach();
     }
 
     close(listen_fd);
