@@ -6,7 +6,9 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <limits>
 #include <netinet/in.h>
 #include <string>
 #include <sys/socket.h>
@@ -126,6 +128,59 @@ bool send_change_dir_reply(int client_fd, bool success) {
     return myftp::send_all(client_fd, &reply, sizeof(reply));
 }
 
+bool send_get_reply(int client_fd, bool success) {
+    const myftp::Header reply = myftp::make_header(
+        myftp::MessageType::GET_REPLY,
+        success ? 1 : 0,
+        myftp::kHeaderLength);
+    return myftp::send_all(client_fd, &reply, sizeof(reply));
+}
+
+bool send_file_data(int client_fd, const std::filesystem::path& file_path) {
+    std::error_code ec;
+    const std::uintmax_t file_size = std::filesystem::file_size(file_path, ec);
+    if (ec ||
+        file_size >
+            static_cast<std::uintmax_t>(
+                std::numeric_limits<std::uint32_t>::max() -
+                myftp::kHeaderLength)) {
+        return false;
+    }
+
+    std::ifstream input(file_path, std::ios::binary);
+    if (!input) {
+        return false;
+    }
+
+    const myftp::Header data_header = myftp::make_header(
+        myftp::MessageType::FILE_DATA,
+        0,
+        myftp::kHeaderLength + static_cast<std::uint32_t>(file_size));
+
+    // 第一次返回，返回一个 FILE_DATA 消息头，告诉客户端接下来要发送的文件数据的总长度（包括协议头和有效负载）。客户端收到这个消息头后，就知道要接收多少字节的数据。
+    if (!myftp::send_all(client_fd, &data_header, sizeof(data_header))) {
+        return false;
+    }
+
+    // Stream the file in chunks rather than assuming one send() can transmit
+    // the whole file. This is binary-safe and also works for the large-file
+    // tests.
+    // 第二次正式返回，返回文件数据的有效负载部分。为了避免一次性发送整个文件数据，使用一个缓冲区分块读取文件数据，并调用 send_all 函数将每一块数据发送给客户端。这样可以保证二进制安全，并且适用于大文件传输。
+    char buffer[8192];
+    while (input) {
+        input.read(buffer, sizeof(buffer));
+        const std::streamsize count = input.gcount();
+        if (count > 0 &&
+            !myftp::send_all(client_fd,
+                             buffer,
+                             static_cast<std::size_t>(count))) {
+            return false;
+        }
+    }
+
+    return input.eof();
+}
+
 bool send_quit_reply(int client_fd) {
     const myftp::Header reply = myftp::make_header(
         myftp::MessageType::QUIT_REPLY,
@@ -168,7 +223,7 @@ void handle_client(int client_fd) {
         std::vector<std::uint8_t> payload(payload_length);
         if (payload_length > 0 &&
             !myftp::recv_all(client_fd, payload.data(), payload.size())) {
-            std::cerr << "failed to receive myFTP payload" << std::endl;
+            std::cerr << "failed to receive myFTP payload" << std::endl; // 如果有效负载长度大于 0，则尝试接收有效负载数据。如果接收失败，则视为无效消息，返回 false。
             return;
         }
 
@@ -251,6 +306,41 @@ void handle_client(int client_fd) {
             continue;
         }
 
+        if (type == myftp::MessageType::GET_REQUEST) {
+            if (payload.empty() || payload.back() != '\0') {
+                std::cerr << "invalid GET_REQUEST payload" << std::endl;
+                return;
+            }
+
+            const std::string filename(
+                reinterpret_cast<const char*>(payload.data()));
+
+            // The payload must contain exactly one null-terminated file name.
+            if (filename.size() + 1 != payload.size()) {
+                std::cerr << "invalid GET_REQUEST payload" << std::endl;
+                return;
+            }
+
+            const std::filesystem::path file_path =
+                current_directory / filename;
+
+            std::error_code ec;
+            const bool exists =
+                std::filesystem::is_regular_file(file_path, ec) && !ec;
+
+            if (!send_get_reply(client_fd, exists)) {
+                std::cerr << "failed to send GET_REPLY" << std::endl;
+                return;
+            }
+
+            if (exists && !send_file_data(client_fd, file_path)) {
+                std::cerr << "failed to send FILE_DATA" << std::endl;
+                return;
+            }
+
+            continue;
+        }
+
         if (type == myftp::MessageType::QUIT_REQUEST) {
             // QUIT_REQUEST 消息不应包含有效负载，因此总长度必须等于协议头长度（12 字节）。如果不满足此条件，则视为无效消息。
             if (message_length != myftp::kHeaderLength) {
@@ -267,7 +357,7 @@ void handle_client(int client_fd) {
             return;
         }
 
-        // GET/PUT/SHA will be implemented in later stages.
+        // PUT/SHA will be implemented in later stages.
         std::cerr << "myFTP message type 0x" << std::hex
                   << static_cast<int>(header.m_type) << std::dec
                   << " is not implemented yet" << std::endl;

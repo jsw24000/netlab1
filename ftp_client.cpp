@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <netinet/in.h>
 #include <sstream>
@@ -113,6 +114,7 @@ bool perform_list_request(int socket_fd) {
         return false;
     }
 
+    // 如果成功接收到返回的协议头，则获取 LIST_REPLY 消息的总长度，并计算有效负载长度。有效负载长度必须大于等于 1 字节（至少包含一个空字符），否则视为无效消息，返回 false。                    
     const std::uint32_t message_length = myftp::total_length(reply); // 可以直接作用于 reply.m_length 字段，获取 LIST_REPLY 消息的总长度，包括协议头和有效负载
     if (message_length < myftp::kHeaderLength + 1) {
         std::cerr << "invalid LIST_REPLY length" << std::endl;
@@ -123,7 +125,7 @@ bool perform_list_request(int socket_fd) {
         message_length - myftp::kHeaderLength;
     std::vector<std::uint8_t> payload(payload_length);
 
-    // 接收 LIST_REPLY 消息的有效负载部分，即文件列表字符串。有效负载长度为总长度减去协议头长度，必须大于等于 1 字节（至少包含一个空字符）。如果接收失败，则返回 false。
+    // 下一步再接收 LIST_REPLY 消息的有效负载部分，即文件列表字符串。有效负载长度为总长度减去协议头长度，必须大于等于 1 字节（至少包含一个空字符）。如果接收失败，则返回 false。
     if (!myftp::recv_all(socket_fd, payload.data(), payload.size())) {
         std::cerr << "failed to receive LIST_REPLY payload" << std::endl;
         return false;
@@ -150,8 +152,8 @@ bool perform_change_dir_request(int socket_fd, const std::string& directory) {
         0,
         myftp::kHeaderLength + payload_length);
 
-    if (!myftp::send_all(socket_fd, &request, sizeof(request)) ||
-        !myftp::send_all(socket_fd, directory.c_str(), payload_length)) {
+    if (!myftp::send_all(socket_fd, &request, sizeof(request)) || // 前半部分的信息被 server 当作协议头去解析
+        !myftp::send_all(socket_fd, directory.c_str(), payload_length)) { // 后半部分的有效负载被 server 当作目录名去解析
         std::cerr << "failed to send CHANGE_DIR_REQUEST" << std::endl;
         return false;
     }
@@ -173,6 +175,97 @@ bool perform_change_dir_request(int socket_fd, const std::string& directory) {
 
     if (reply.m_status == 0) {
         std::cerr << "server directory does not exist" << std::endl;
+    }
+
+    return true;
+}
+
+bool perform_get_request(int socket_fd, const std::string& filename) {
+    // GET_REQUEST carries one null-terminated file name as payload.
+    const std::uint32_t payload_length =
+        static_cast<std::uint32_t>(filename.size() + 1);
+    const myftp::Header request = myftp::make_header(
+        myftp::MessageType::GET_REQUEST,
+        0,
+        myftp::kHeaderLength + payload_length);
+
+    if (!myftp::send_all(socket_fd, &request, sizeof(request)) ||
+        !myftp::send_all(socket_fd, filename.c_str(), payload_length)) {
+        std::cerr << "failed to send GET_REQUEST" << std::endl;
+        return false;
+    }
+
+    // 先接收 GET_REPLY 消息头，判断服务器是否存在该文件。如果不存在，则返回 true，表示请求成功，但文件不存在。如果存在，则继续接收 FILE_DATA 消息头和有效负载，即文件数据，并将其写入本地文件中。
+    myftp::Header reply{};
+    if (!myftp::recv_all(socket_fd, &reply, sizeof(reply))) {
+        std::cerr << "failed to receive GET_REPLY" << std::endl;
+        return false;
+    }
+
+    if (!myftp::has_valid_magic(reply) ||
+        reply.m_type != static_cast<std::uint8_t>(
+                            myftp::MessageType::GET_REPLY) ||
+        (reply.m_status != 0 && reply.m_status != 1) ||
+        myftp::total_length(reply) != myftp::kHeaderLength) {
+        std::cerr << "invalid GET_REPLY" << std::endl;
+        return false;
+    }
+
+    if (reply.m_status == 0) {
+        std::cerr << "server file does not exist" << std::endl;
+        return true;
+    }
+
+    // 如果存在文件，下一步先接收 FILE_DATA 消息头，判断其总长度是否大于等于协议头长度（12 字节），否则视为无效消息，返回 false。然后计算文件数据的有效负载长度，并接收文件数据的有效负载部分。如果接收失败，则返回 false。最后将接收到的文件数据写入本地文件中，如果写入失败，则返回 false。
+    myftp::Header data_header{};
+    if (!myftp::recv_all(socket_fd, &data_header, sizeof(data_header))) {
+        std::cerr << "failed to receive FILE_DATA header" << std::endl;
+        return false;
+    }
+
+    if (!myftp::has_valid_magic(data_header) ||
+        data_header.m_type != static_cast<std::uint8_t>(
+                                  myftp::MessageType::FILE_DATA)) {
+        std::cerr << "invalid FILE_DATA message" << std::endl;
+        return false;
+    }
+
+    const std::uint32_t data_message_length =
+        myftp::total_length(data_header);
+    if (data_message_length < myftp::kHeaderLength) {
+        std::cerr << "invalid FILE_DATA length" << std::endl;
+        return false;
+    }
+
+    const std::uint32_t file_size =
+        data_message_length - myftp::kHeaderLength;
+    std::vector<std::uint8_t> file_data(file_size);
+
+    // 最后再接收 FILE_DATA 消息的有效负载部分，即文件数据。如果接收失败，则返回 false。然后将接收到的文件数据写入本地文件中，如果写入失败，则返回 false。最后返回 true，表示文件下载成功。
+    if (file_size > 0 &&
+        !myftp::recv_all(socket_fd, file_data.data(), file_data.size())) {
+        std::cerr << "failed to receive file data" << std::endl;
+        return false;
+    }
+
+    // Files may be ASCII or binary, and an existing local file must be
+    // overwritten.
+    std::ofstream output(filename,
+                         std::ios::binary | std::ios::trunc);
+    if (!output) {
+        std::cerr << "failed to open local file for writing: "
+                  << filename << std::endl;
+        return false;
+    }
+
+    if (!file_data.empty()) {
+        output.write(reinterpret_cast<const char*>(file_data.data()),
+                     static_cast<std::streamsize>(file_data.size()));
+    }
+
+    if (!output) {
+        std::cerr << "failed to write local file: " << filename << std::endl;
+        return false;
     }
 
     return true;
@@ -290,6 +383,23 @@ int main() {
             }
 
             perform_change_dir_request(socket_fd, directory);
+            continue;
+        }
+
+        if (command == "get") {
+            if (socket_fd < 0) {
+                std::cerr << "no myFTP connection is open" << std::endl;
+                continue;
+            }
+
+            std::string filename;
+            std::string extra;
+            if (!(input >> filename) || (input >> extra)) {
+                std::cerr << "usage: get <filename>" << std::endl;
+                continue;
+            }
+
+            perform_get_request(socket_fd, filename);
             continue;
         }
 
