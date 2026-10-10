@@ -244,6 +244,68 @@ bool receive_file_data(int client_fd,
     return true;
 }
 
+bool send_sha_reply(int client_fd, bool success) {
+    const myftp::Header reply = myftp::make_header(
+        myftp::MessageType::SHA_REPLY,
+        success ? 1 : 0,
+        myftp::kHeaderLength);
+    return myftp::send_all(client_fd, &reply, sizeof(reply));
+}
+
+bool get_sha256(const std::filesystem::path& current_directory,
+                const std::string& filename,
+                std::string& checksum) {
+    // Execute sha256sum in this client's logical current directory so its
+    // output uses the requested file name instead of an absolute path.
+    const std::string command =
+        "cd " + shell_quote(current_directory.string()) +
+        " && sha256sum " + shell_quote(filename);
+
+    FILE* pipe = popen(command.c_str(), "r");
+    if (pipe == nullptr) {
+        return false;
+    }
+
+    char buffer[256];
+    while (true) {
+        const std::size_t count = std::fread(buffer, 1, sizeof(buffer), pipe);
+        if (count > 0) {
+            checksum.append(buffer, count);
+        }
+
+        if (count < sizeof(buffer)) {
+            if (std::feof(pipe)) {
+                break;
+            }
+            if (std::ferror(pipe)) {
+                pclose(pipe);
+                return false;
+            }
+        }
+    }
+
+    return pclose(pipe) == 0;
+}
+
+bool send_sha_file_data(int client_fd, const std::string& checksum) {
+    // SHA FILE_DATA is a null-terminated string, unlike GET/PUT FILE_DATA
+    // whose payload is raw file bytes.
+    const std::uint32_t payload_length =
+        static_cast<std::uint32_t>(checksum.size() + 1);
+    const myftp::Header data_header = myftp::make_header(
+        myftp::MessageType::FILE_DATA,
+        0,
+        myftp::kHeaderLength + payload_length);
+
+    if (!myftp::send_all(client_fd, &data_header, sizeof(data_header))) {
+        return false;
+    }
+
+    return myftp::send_all(client_fd,
+                           checksum.c_str(),
+                           payload_length);
+}
+
 bool send_quit_reply(int client_fd) {
     const myftp::Header reply = myftp::make_header(
         myftp::MessageType::QUIT_REPLY,
@@ -279,7 +341,7 @@ void handle_client(int client_fd) {
 
         const std::uint32_t payload_length =
             message_length - myftp::kHeaderLength;
-        // 读取消息头后，计算消息的总长度和有效负载长度。消息总长度必须大于等于 myFTP 协议头的长度（12 字节），否则视为无效消息。有效负载长度为总长度减去协议头长度。
+        // 读取消息头后，计算消息的总长度和有效负载长度。消息总长度必须大于等于 myFTP 协议头长度（12 字节），否则视为无效消息。有效负载长度为总长度减去协议头长度。
 
         // Consume the payload before dispatching the message so that the TCP
         // byte stream stays aligned at the next myFTP header.
@@ -436,6 +498,50 @@ void handle_client(int client_fd) {
             continue;
         }
 
+        if (type == myftp::MessageType::SHA_REQUEST) {
+            if (payload.empty() || payload.back() != '\0') {
+                std::cerr << "invalid SHA_REQUEST payload" << std::endl;
+                return;
+            }
+
+            const std::string filename(
+                reinterpret_cast<const char*>(payload.data()));
+
+            // The payload must contain exactly one null-terminated file name.
+            if (filename.size() + 1 != payload.size()) {
+                std::cerr << "invalid SHA_REQUEST payload" << std::endl;
+                return;
+            }
+
+            const std::filesystem::path file_path =
+                current_directory / filename;
+
+            std::error_code ec;
+            const bool exists =
+                std::filesystem::is_regular_file(file_path, ec) && !ec;
+
+            if (!send_sha_reply(client_fd, exists)) {
+                std::cerr << "failed to send SHA_REPLY" << std::endl;
+                return;
+            }
+
+            if (exists) {
+                std::string checksum;
+                if (!get_sha256(current_directory, filename, checksum)) {
+                    std::cerr << "failed to calculate sha256 checksum"
+                              << std::endl;
+                    return;
+                }
+
+                if (!send_sha_file_data(client_fd, checksum)) {
+                    std::cerr << "failed to send SHA FILE_DATA" << std::endl;
+                    return;
+                }
+            }
+
+            continue;
+        }
+
         if (type == myftp::MessageType::QUIT_REQUEST) {
             // QUIT_REQUEST 消息不应包含有效负载，因此总长度必须等于协议头长度（12 字节）。如果不满足此条件，则视为无效消息。
             if (message_length != myftp::kHeaderLength) {
@@ -452,7 +558,6 @@ void handle_client(int client_fd) {
             return;
         }
 
-        // SHA will be implemented in a later stage.
         std::cerr << "myFTP message type 0x" << std::hex
                   << static_cast<int>(header.m_type) << std::dec
                   << " is not implemented yet" << std::endl;

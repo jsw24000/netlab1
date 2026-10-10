@@ -363,6 +363,85 @@ bool perform_put_request(int socket_fd, const std::string& filename) {
     return true;
 }
 
+bool perform_sha_request(int socket_fd, const std::string& filename) {
+    // SHA_REQUEST carries one null-terminated file name as payload.
+    const std::uint32_t payload_length =
+        static_cast<std::uint32_t>(filename.size() + 1);
+    const myftp::Header request = myftp::make_header(
+        myftp::MessageType::SHA_REQUEST,
+        0,
+        myftp::kHeaderLength + payload_length);
+
+    if (!myftp::send_all(socket_fd, &request, sizeof(request)) ||
+        !myftp::send_all(socket_fd, filename.c_str(), payload_length)) {
+        std::cerr << "failed to send SHA_REQUEST" << std::endl;
+        return false;
+    }
+
+    myftp::Header reply{};
+    if (!myftp::recv_all(socket_fd, &reply, sizeof(reply))) {
+        std::cerr << "failed to receive SHA_REPLY" << std::endl;
+        return false;
+    }
+
+    if (!myftp::has_valid_magic(reply) ||
+        reply.m_type != static_cast<std::uint8_t>(
+                            myftp::MessageType::SHA_REPLY) ||
+        (reply.m_status != 0 && reply.m_status != 1) ||
+        myftp::total_length(reply) != myftp::kHeaderLength) {
+        std::cerr << "invalid SHA_REPLY" << std::endl;
+        return false;
+    }
+
+    if (reply.m_status == 0) {
+        std::cerr << "server file does not exist" << std::endl;
+        return true;
+    }
+
+    // When the file exists, the checksum is carried in a separate FILE_DATA
+    // message as one null-terminated string.
+    // 这一步的 Header 是 FILE_DATA 消息头，表示接下来要接收的有效负载是文件的 SHA256 校验和。然后接收 FILE_DATA 消息头和有效负载，并将其写入标准输出。如果接收失败，则返回 false。最后返回 true，表示成功获取文件的 SHA256 校验和。
+    myftp::Header data_header{};
+    if (!myftp::recv_all(socket_fd, &data_header, sizeof(data_header))) {
+        std::cerr << "failed to receive SHA FILE_DATA header" << std::endl;
+        return false;
+    }
+
+    if (!myftp::has_valid_magic(data_header) ||
+        data_header.m_type != static_cast<std::uint8_t>(
+                                  myftp::MessageType::FILE_DATA)) {
+        std::cerr << "invalid SHA FILE_DATA message" << std::endl;
+        return false;
+    }
+
+    const std::uint32_t data_message_length =
+        myftp::total_length(data_header);
+    if (data_message_length < myftp::kHeaderLength + 1) {
+        std::cerr << "invalid SHA FILE_DATA length" << std::endl;
+        return false;
+    }
+
+    const std::uint32_t checksum_length =
+        data_message_length - myftp::kHeaderLength;
+    std::vector<std::uint8_t> checksum(checksum_length);
+
+    // 接收 FILE_DATA 消息的有效负载部分，即文件的 SHA256 校验和。如果接收失败，则返回 false。然后检查有效负载的最后一个字节是否为 '\0'，如果不是，则视为无效消息，返回 false。最后将接收到的校验和写入标准输出，并刷新输出缓冲区，返回 true，表示成功获取文件的 SHA256 校验和。
+    if (!myftp::recv_all(socket_fd, checksum.data(), checksum.size())) {
+        std::cerr << "failed to receive sha256 checksum" << std::endl;
+        return false;
+    }
+
+    if (checksum.back() != '\0') {
+        std::cerr << "invalid sha256 checksum payload" << std::endl;
+        return false;
+    }
+
+    std::cout.write(reinterpret_cast<const char*>(checksum.data()),
+                    static_cast<std::streamsize>(checksum.size() - 1));
+    std::cout.flush();
+    return true;
+}
+
 bool perform_quit_handshake(int socket_fd) {
     const myftp::Header request = myftp::make_header(
         myftp::MessageType::QUIT_REQUEST,
@@ -509,6 +588,23 @@ int main() {
             }
 
             perform_put_request(socket_fd, filename);
+            continue;
+        }
+
+        if (command == "sha256") {
+            if (socket_fd < 0) {
+                std::cerr << "no myFTP connection is open" << std::endl;
+                continue;
+            }
+
+            std::string filename;
+            std::string extra;
+            if (!(input >> filename) || (input >> extra)) {
+                std::cerr << "usage: sha256 <filename>" << std::endl;
+                continue;
+            }
+
+            perform_sha_request(socket_fd, filename);
             continue;
         }
 
