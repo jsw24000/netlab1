@@ -1,11 +1,15 @@
+#include "protocol.hpp"
+
 #include <arpa/inet.h>
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <netinet/in.h>
 #include <string>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <vector>
 
 namespace {
 
@@ -25,7 +29,10 @@ bool parse_port(const std::string& text, uint16_t& port) {
 
 void print_client_address(const sockaddr_in& client_addr) {
     char ip_buffer[INET_ADDRSTRLEN] = {0};
-    if (inet_ntop(AF_INET, &client_addr.sin_addr, ip_buffer, sizeof(ip_buffer)) == nullptr) {
+    if (inet_ntop(AF_INET,
+                  &client_addr.sin_addr,
+                  ip_buffer,
+                  sizeof(ip_buffer)) == nullptr) {
         std::cerr << "accept succeeded, but failed to format client IP: "
                   << std::strerror(errno) << std::endl;
         return;
@@ -33,6 +40,81 @@ void print_client_address(const sockaddr_in& client_addr) {
 
     std::cout << "TCP client connected from " << ip_buffer << ':'
               << ntohs(client_addr.sin_port) << std::endl;
+}
+
+bool send_open_reply(int client_fd) {
+    const myftp::Header reply = myftp::make_header(
+        myftp::MessageType::OPEN_CONN_REPLY,
+        1,
+        myftp::kHeaderLength);
+    return myftp::send_all(client_fd, &reply, sizeof(reply));
+    // 调用 send_all 函数将 OPEN_CONN_REPLY 消息发送给客户端，表示 myFTP 连接已建立
+}
+
+void handle_client(int client_fd) {
+    bool myftp_open = false;
+
+    while (true) {
+        myftp::Header header{};
+        if (!myftp::recv_all(client_fd, &header, sizeof(header))) {
+            std::cout << "TCP client disconnected" << std::endl;
+            return;
+        }
+
+        if (!myftp::has_valid_magic(header)) {
+            std::cerr << "invalid myFTP magic number" << std::endl;
+            return;
+        }
+
+        const std::uint32_t message_length = myftp::total_length(header);
+        if (message_length < myftp::kHeaderLength) {
+            std::cerr << "invalid myFTP message length" << std::endl;
+            return;
+        }
+
+        const std::uint32_t payload_length =
+            message_length - myftp::kHeaderLength;
+        // 读取消息头后，计算消息的总长度和有效负载长度。消息总长度必须大于等于 myFTP 协议头的长度（12 字节），否则视为无效消息。有效负载长度为总长度减去协议头长度。
+
+        // Stage 2 only needs OPEN, but consume any payload of an unsupported
+        // message so that the TCP byte stream stays aligned at the next header.
+        std::vector<std::uint8_t> payload(payload_length);
+        if (payload_length > 0 &&
+            !myftp::recv_all(client_fd, payload.data(), payload.size())) {
+            std::cerr << "failed to receive myFTP payload" << std::endl;
+            return;
+        }
+
+        const auto type = static_cast<myftp::MessageType>(header.m_type);
+
+        if (type == myftp::MessageType::OPEN_CONN_REQUEST) {
+            if (message_length != myftp::kHeaderLength) {
+                // OPEN_CONN_REQUEST 消息不应包含有效负载，因此总长度必须等于协议头长度（12 字节）。如果不满足此条件，则视为无效消息。
+                std::cerr << "invalid OPEN_CONN_REQUEST length" << std::endl;
+                return;
+            }
+
+            if (!send_open_reply(client_fd)) {
+                std::cerr << "failed to send OPEN_CONN_REPLY" << std::endl;
+                return;
+            }
+
+            myftp_open = true; // 收到了 OPEN_CONN_REQUEST 并成功发送了 OPEN_CONN_REPLY，表示 myFTP 连接已建立
+            std::cout << "myFTP OPEN handshake completed" << std::endl;
+            continue;
+        }
+
+        if (!myftp_open) {
+            std::cerr << "received myFTP command before OPEN handshake"
+                      << std::endl;
+            return;
+        }
+
+        // LIST/CD/GET/PUT/SHA/QUIT will be implemented in later stages.
+        std::cerr << "myFTP message type 0x" << std::hex
+                  << static_cast<int>(header.m_type) << std::dec
+                  << " is not implemented yet" << std::endl;
+    }
 }
 
 }  // namespace
@@ -50,23 +132,25 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // 1. Create an IPv4 TCP socket.
-    const int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    const int listen_fd = socket(AF_INET, SOCK_STREAM, 0); // 创建一个 TCP 套接字，用于监听客户端连接请求
     if (listen_fd < 0) {
         std::cerr << "socket failed: " << std::strerror(errno) << std::endl;
         return 1;
     }
 
-    // Allow quick restart of the server after it exits.
     int reuse = 1;
-    if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
-        std::cerr << "setsockopt(SO_REUSEADDR) failed: " << std::strerror(errno)
-                  << std::endl;
+    if (setsockopt(listen_fd,
+                   SOL_SOCKET,
+                   SO_REUSEADDR,
+                   &reuse,
+                   sizeof(reuse)) < 0) {
+        std::cerr << "setsockopt(SO_REUSEADDR) failed: "
+                  << std::strerror(errno) << std::endl;
         close(listen_fd);
         return 1;
     }
+    //
 
-    // 2. Build the local IPv4 address and bind it to the socket.
     sockaddr_in server_addr{};
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(listen_port);
@@ -85,7 +169,6 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // 3. Turn the socket into a listening socket.
     if (listen(listen_fd, SOMAXCONN) < 0) {
         std::cerr << "listen failed: " << std::strerror(errno) << std::endl;
         close(listen_fd);
@@ -95,19 +178,17 @@ int main(int argc, char* argv[]) {
     std::cout << "TCP server listening on " << listen_ip << ':' << listen_port
               << std::endl;
 
-    // Stage 1 only: accept one client at a time and wait until that TCP
-    // connection closes. myFTP message parsing will be added in the next stage.
+    // Still single-client-at-a-time at this stage. Concurrency will be added
+    // after the core myFTP request/reply behavior is correct.
     while (true) {
         sockaddr_in client_addr{};
         socklen_t client_addr_len = sizeof(client_addr);
 
         int client_fd = -1;
         while (true) {
-            client_fd = accept(
-                listen_fd,
-                reinterpret_cast<sockaddr*>(&client_addr),
-                &client_addr_len);
-
+            client_fd = accept(listen_fd,
+                               reinterpret_cast<sockaddr*>(&client_addr),
+                               &client_addr_len);
             if (client_fd >= 0) {
                 break;
             }
@@ -121,28 +202,7 @@ int main(int argc, char* argv[]) {
         }
 
         print_client_address(client_addr);
-
-        // There is no application-layer protocol in Stage 1 yet. recv() is used
-        // only to detect whether the peer has closed the TCP connection.
-        char buffer[1024];
-        while (true) {
-            const ssize_t received = recv(client_fd, buffer, sizeof(buffer), 0);
-            if (received > 0) {
-                // Application data is intentionally ignored in Stage 1.
-                continue;
-            }
-            if (received == 0) {
-                std::cout << "TCP client disconnected" << std::endl;
-                break;
-            }
-            if (errno == EINTR) {
-                continue;
-            }
-
-            std::cerr << "recv failed: " << std::strerror(errno) << std::endl;
-            break;
-        }
-
+        handle_client(client_fd);
         close(client_fd);
     }
 
