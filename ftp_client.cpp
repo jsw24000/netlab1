@@ -88,6 +88,36 @@ bool perform_open_handshake(int socket_fd) {
     return true;
 }
 
+bool perform_quit_handshake(int socket_fd) {
+    const myftp::Header request = myftp::make_header(
+        myftp::MessageType::QUIT_REQUEST,
+        0,
+        myftp::kHeaderLength);
+
+    // 发送 QUIT_REQUEST 消息给服务器，表示客户端希望关闭 myFTP 连接
+    if (!myftp::send_all(socket_fd, &request, sizeof(request))) {
+        std::cerr << "failed to send QUIT_REQUEST" << std::endl;
+        return false;
+    }
+
+    myftp::Header reply{};
+    if (!myftp::recv_all(socket_fd, &reply, sizeof(reply))) {
+        std::cerr << "failed to receive QUIT_REPLY" << std::endl;
+        return false;
+    }
+
+    if (!myftp::has_valid_magic(reply) ||
+        reply.m_type != static_cast<std::uint8_t>(
+                            myftp::MessageType::QUIT_REPLY) ||
+        myftp::total_length(reply) != myftp::kHeaderLength) {
+        std::cerr << "invalid QUIT_REPLY" << std::endl;
+        return false;
+    }
+
+    // 如果 QUIT_REPLY 消息的魔数、消息类型或总长度不符合 myFTP 协议规范，则视为无效消息，返回 false。否则，返回 true，表示 myFTP 连接已成功关闭
+    return true;
+}
+
 }  // namespace
 
 int main() {
@@ -142,12 +172,17 @@ int main() {
 
         if (command == "quit") {
             if (socket_fd >= 0) {
-                // QUIT_REQUEST / QUIT_REPLY is intentionally left for a later
-                // protocol stage. For now this only closes the TCP connection.
+                // In the Main state, quit performs the myFTP close handshake
+                // and then returns the client to the Idle state.
+                const bool quit_ok = perform_quit_handshake(socket_fd);
                 close(socket_fd);
                 socket_fd = -1;
-                std::cout << "TCP connection closed" << std::endl;
+
+                if (quit_ok) {
+                    std::cout << "myFTP connection closed" << std::endl;
+                }
             } else {
+                // In the Idle state, quit exits the client process.
                 return 0;
             }
             continue;

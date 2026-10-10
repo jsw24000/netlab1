@@ -10,7 +10,7 @@
 namespace myftp {
 // myFTP 协议定义
 
-constexpr std::size_t kMagicNumberLength = 6;
+constexpr std::size_t kMagicNumberLength = 6; // sizeof(Header::m_protocol) must be exactly 6 bytes
 constexpr std::uint32_t kHeaderLength = 12; // sizeof(Header) must be exactly 12 bytes
 
 constexpr std::uint8_t kMagicNumber[kMagicNumberLength] = {
@@ -49,7 +49,8 @@ inline Header make_header(MessageType type,
                           std::uint8_t status,
                           std::uint32_t total_length) {
     Header header{};
-    std::memcpy(header.m_protocol, kMagicNumber, kMagicNumberLength);
+    std::memcpy(header.m_protocol, kMagicNumber, kMagicNumberLength); // 将 myFTP 协议的魔数（magic number）复制到消息头的 m_protocol 字段中
+    // 其余的字段包括消息类型（m_type）、状态码（m_status）和消息总长度（m_length）。消息总长度是指整个 myFTP 消息的字节数，包括协议头和有效负载。
     header.m_type = static_cast<std::uint8_t>(type);
     header.m_status = status;
     header.m_length = htonl(total_length);

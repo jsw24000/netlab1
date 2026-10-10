@@ -51,6 +51,14 @@ bool send_open_reply(int client_fd) {
     // 调用 send_all 函数将 OPEN_CONN_REPLY 消息发送给客户端，表示 myFTP 连接已建立
 }
 
+bool send_quit_reply(int client_fd) {
+    const myftp::Header reply = myftp::make_header(
+        myftp::MessageType::QUIT_REPLY,
+        0,
+        myftp::kHeaderLength);
+    return myftp::send_all(client_fd, &reply, sizeof(reply));
+}
+
 void handle_client(int client_fd) {
     bool myftp_open = false;
 
@@ -76,8 +84,9 @@ void handle_client(int client_fd) {
             message_length - myftp::kHeaderLength;
         // 读取消息头后，计算消息的总长度和有效负载长度。消息总长度必须大于等于 myFTP 协议头的长度（12 字节），否则视为无效消息。有效负载长度为总长度减去协议头长度。
 
-        // Stage 2 only needs OPEN, but consume any payload of an unsupported
-        // message so that the TCP byte stream stays aligned at the next header.
+        // At this stage OPEN and QUIT have no payload. Still consume any
+        // payload of an unsupported message so that the TCP byte stream stays
+        // aligned at the next header.
         std::vector<std::uint8_t> payload(payload_length);
         if (payload_length > 0 &&
             !myftp::recv_all(client_fd, payload.data(), payload.size())) {
@@ -110,7 +119,23 @@ void handle_client(int client_fd) {
             return;
         }
 
-        // LIST/CD/GET/PUT/SHA/QUIT will be implemented in later stages.
+        if (type == myftp::MessageType::QUIT_REQUEST) {
+            // QUIT_REQUEST 消息不应包含有效负载，因此总长度必须等于协议头长度（12 字节）。如果不满足此条件，则视为无效消息。
+            if (message_length != myftp::kHeaderLength) {
+                std::cerr << "invalid QUIT_REQUEST length" << std::endl;
+                return;
+            }
+
+            if (!send_quit_reply(client_fd)) {
+                std::cerr << "failed to send QUIT_REPLY" << std::endl;
+                return;
+            }
+
+            std::cout << "myFTP QUIT handshake completed" << std::endl;
+            return;
+        }
+
+        // LIST/CD/GET/PUT/SHA will be implemented in later stages.
         std::cerr << "myFTP message type 0x" << std::hex
                   << static_cast<int>(header.m_type) << std::dec
                   << " is not implemented yet" << std::endl;
