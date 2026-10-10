@@ -53,7 +53,6 @@ bool send_open_reply(int client_fd) {
 }
 
 bool get_file_list(std::string& file_list) {
-    // 把 ls 命令的输出重定向到一个管道中，然后从管道中读取文件列表并存储在 file_list 字符串中
     FILE* pipe = popen("ls", "r");
     if (pipe == nullptr) {
         return false;
@@ -85,8 +84,7 @@ bool send_list_reply(int client_fd, const std::string& file_list) {
     // '\0' is included in m_length and must also be sent on the TCP stream.
     const std::uint32_t payload_length =
         static_cast<std::uint32_t>(file_list.size() + 1);
-    
-    const myftp::Header reply = myftp::make_header( // 创建一个 LIST_REPLY 消息头，消息类型为 LIST_REPLY，状态码为 0，总长度为协议头长度加上有效负载长度（即文件列表字符串的长度加上一个空字符）
+    const myftp::Header reply = myftp::make_header(
         myftp::MessageType::LIST_REPLY,
         0,
         myftp::kHeaderLength + payload_length);
@@ -123,7 +121,7 @@ void handle_client(int client_fd) {
             return;
         }
 
-        const std::uint32_t message_length = myftp::total_length(header); // 读取消息头后，获取消息的总长度，包括协议头和有效负载。这个长度是从网络字节序转换为主机字节序后的值
+        const std::uint32_t message_length = myftp::total_length(header); // 可以直接作用于 myftp::Header 对象，获取消息的总长度（包括协议头和有效负载）。这个长度是从网络字节序转换为主机字节序后的值，用于确定接下来需要读取多少字节的数据。
         if (message_length < myftp::kHeaderLength) {
             std::cerr << "invalid myFTP message length" << std::endl;
             return;
